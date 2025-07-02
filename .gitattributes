@@ -1,0 +1,2 @@
+# 노트북 파일은 바이너리로 처리 → CRLF/LF 변환 X
+*.ipynb binary
