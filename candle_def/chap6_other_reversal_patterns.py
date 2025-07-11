@@ -34,7 +34,7 @@ df=pd.read_csv('')
 
 #상승추세 이후의 잉태형(상승잉태형)
 def is_harami_after_uptrend(df):
-    uptrend = is_uptrend(df).shift(-2).fillna(False)
+    uptrend = is_uptrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -42,11 +42,10 @@ def is_harami_after_uptrend(df):
     c = df['종가']
     body = (o - c).abs()
 
-    o1 = o.shift(-1)
-    c1 = c.shift(-1)
-    h1 = h.shift(-1)
-    l1 = l.shift(-1)
-    body_1 = body.shift(-1)
+    o1 = o.shift(1)
+    c1 = c.shift(1)
+
+    body_1 = body.shift(1)
 
 
     # 몸통이 비정상적으로 큰 음봉 또는 양봉
@@ -73,7 +72,7 @@ def is_harami_after_uptrend(df):
 
 #하락추세 이후의 잉태형(하락잉태형)
 def is_harami_after_downtrend(df):
-    downtrend = is_downtrend(df).shift(-2).fillna(False)
+    downtrend = is_downtrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -81,11 +80,10 @@ def is_harami_after_downtrend(df):
     c = df['종가']
     body = (o - c).abs()
 
-    o1 = o.shift(-1)
-    c1 = c.shift(-1)
-    h1 = h.shift(-1)
-    l1 = l.shift(-1)
-    body_1 = body.shift(-1)
+    o1 = o.shift(1)
+    c1 = c.shift(1)
+
+    body_1 = body.shift(1)
 
 
     # 몸통이 비정상적으로 큰 음봉 또는 양봉
@@ -121,7 +119,7 @@ def is_harami_after_downtrend(df):
 
 #상승추세 이후의 십자잉태형(상승십자잉태형)
 def is_harami_cross_after_uptrend(df):
-    uptrend = is_uptrend(df).shift(-2).fillna(False)
+    uptrend = is_uptrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -129,11 +127,11 @@ def is_harami_cross_after_uptrend(df):
     c = df['종가']
     body = (o - c).abs()
 
-    o1 = o.shift(-1)
-    c1 = c.shift(-1)
-    h1 = h.shift(-1)
-    l1 = l.shift(-1)
-    body_1 = body.shift(-1)
+    o1 = o.shift(1)
+    c1 = c.shift(1)
+    h1 = h.shift(1)
+    l1 = l.shift(1)
+    body_1 = body.shift(1)
 
 
     # 몸통이 비정상적으로 큰 음봉 또는 양봉
@@ -160,7 +158,7 @@ def is_harami_cross_after_uptrend(df):
 
 #하락추세 이후의 십자잉태형(하락십자잉태형)
 def is_harami_cross_after_downtrend(df):
-    downtrend = is_downtrend(df).shift(-2).fillna(False)
+    downtrend = is_downtrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -168,11 +166,11 @@ def is_harami_cross_after_downtrend(df):
     c = df['종가']
     body = (o - c).abs()
 
-    o1 = o.shift(-1)
-    c1 = c.shift(-1)
-    h1 = h.shift(-1)
-    l1 = l.shift(-1)
-    body_1 = body.shift(-1)
+    o1 = o.shift(1)
+    c1 = c.shift(1)
+    h1 = h.shift(1)
+    l1 = l.shift(1)
+    body_1 = body.shift(1)
 
 
     # 몸통이 비정상적으로 큰 음봉 또는 양봉
@@ -214,9 +212,9 @@ def is_tweezers_top(df):
     uptrend = is_uptrend(df).fillna(False)
 
     h = df['고가']
-    h1 = h.shift(-1)
+    h1 = h.shift(1)
     body = (df['시가'] - df['종가']).abs()
-    body_1 = body.shift(-1)
+    body_1 = body.shift(1)
 
     same_high = (h - h1).abs() <= h * 0.001
 
@@ -233,9 +231,9 @@ def is_tweezers_bottom(df):
     downtrend = is_downtrend(df).fillna(False)
 
     l = df['저가']
-    l1 = l.shift(-1)
+    l1 = l.shift(1)
     body = (df['시가'] - df['종가']).abs()
-    body_1 = body.shift(-1)
+    body_1 = body.shift(1)
 
     same_low = (l-l1).abs() <= l * 0.001
 
@@ -297,7 +295,7 @@ def is_belt_hold_line_after_uptrend(df):
 
 #까마귀형 (하락 반전신호)
 def is_upside_gap_two_crows(df):
-    uptrend = is_uptrend(df).shift(-2).fillna(False)
+    uptrend = is_uptrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -305,11 +303,11 @@ def is_upside_gap_two_crows(df):
     c = df['종가']
     body = (o - c).abs()
 
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
-    body_1, body_2 = body.shift(-1), body.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
+    body_1, body_2 = body.shift(1), body.shift(2)
 
 
     first_bullish = c2 > o2
@@ -337,10 +335,9 @@ def is_three_black_crow(df):
     l = df['저가']
     c = df['종가']
 
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
 
     all_bearish = (c2 < o2) & (c1 < o1) & (c < o)
     sim_close_low = ((l - c).abs() <= c * 0.1) & ((l1 - c1).abs() <= c * 0.1) & ((l2 - c2).abs() <= c * 0.1)
@@ -363,11 +360,10 @@ def is_three_advancing_white_soldier(df):
     o = df['시가']
     h = df['고가']
     c = df['종가']
-    body = (o - c).abs()
 
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
 
     all_bullish = (c2 > o2) & (c1 > o1) & (c > o)
     all_long = (((c2 - o2) / o2) >= 0.03) & (((c1 - o1) / o1) >= 0.03) & (((c - o) / o) >= 0.03)
@@ -426,7 +422,7 @@ def is_three_river(df):
 #상승반격형 (하락반전신호)
 def is_counterattack_lines_after_downtrend(df):
 
-  downtrend = is_downtrend(df).shift(-1).fillna(False)
+  downtrend = is_downtrend(df).shift(1).fillna(False)
 
   o = df['시가']
   h = df['고가']
@@ -434,11 +430,11 @@ def is_counterattack_lines_after_downtrend(df):
   c = df['종가']
   body = (o - c).abs()
 
-  o1 = o.shift(-1)
-  c1 = c.shift(-1)
-  h1 = h.shift(-1)
-  l1 = l.shift(-1)
-  body_1 = body.shift(-1)
+  o1 = o.shift(1)
+  c1 = c.shift(1)
+  h1 = h.shift(1)
+  l1 = l.shift(1)
+  body_1 = body.shift(1)
 
   long_bearish = ((o1 - c1) / o1) >= 0.03
 
@@ -453,7 +449,7 @@ def is_counterattack_lines_after_downtrend(df):
 #하락반격형 (상승반전신호)
 def is_counterattack_lines_after_uptrend(df):
 
-  uptrend = is_uptrend(df).shift(-1).fillna(False)
+  uptrend = is_uptrend(df).shift(1).fillna(False)
 
   o = df['시가']
   h = df['고가']
@@ -461,11 +457,10 @@ def is_counterattack_lines_after_uptrend(df):
   c = df['종가']
   body = (o - c).abs()
 
-  o1 = o.shift(-1)
-  c1 = c.shift(-1)
-  h1 = h.shift(-1)
-  l1 = l.shift(-1)
-  body_1 = body.shift(-1)
+  o1 = o.shift(1)
+  c1 = c.shift(1)
+
+  body_1 = body.shift(1)
 
   long_bullish = ((c1-o1) / o1) >= 0.03
 

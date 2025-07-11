@@ -47,7 +47,7 @@ df=pd.read_csv('')
 
 
 def is_morning_star(df):
-    downtrend = is_downtrend(df).shift(-2).fillna(False)
+    downtrend = is_downtrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -57,11 +57,11 @@ def is_morning_star(df):
 
 
     # 1일 전, 2일 전 값
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
-    body_1, body_2 = body.shift(-1), body.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
+    body_1, body_2 = body.shift(1), body.shift(2)
 
     #첫 번째 캔들
     first_bearish = c2 < o2
@@ -117,7 +117,7 @@ print(df[mask_ext])
 '''
 
 def is_evening_star(df):
-    uptrend = is_uptrend(df).shift(-2).fillna(False)
+    uptrend = is_uptrend(df).shift(2).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -127,11 +127,11 @@ def is_evening_star(df):
 
 
     # 1일 전, 2일 전 값
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
-    body_1, body_2 = body.shift(-1), body.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
+    body_1, body_2 = body.shift(1), body.shift(2)
 
 
     #첫 번째 캔들
@@ -172,11 +172,11 @@ def is_morning_doji_star(df):
 
 
     # 1일 전, 2일 전 값
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
-    body_1, body_2 = body.shift(-1), body.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
+    body_1, body_2 = body.shift(1), body.shift(2)
 
     #첫 번째 캔들
     first_bearish = c2 < o2
@@ -216,11 +216,11 @@ def is_evening_doji_star(df):
     body = (o - c).abs()
 
     # 1일 전, 2일 전 값
-    o1, o2 = o.shift(-1), o.shift(-2)
-    c1, c2 = c.shift(-1), c.shift(-2)
-    h1, h2 = h.shift(-1), h.shift(-2)
-    l1, l2 = l.shift(-1), l.shift(-2)
-    body_1, body_2 = body.shift(-1), body.shift(-2)
+    o1, o2 = o.shift(1), o.shift(2)
+    c1, c2 = c.shift(1), c.shift(2)
+    h1, h2 = h.shift(1), h.shift(2)
+    l1, l2 = l.shift(1), l.shift(2)
+    body_1, body_2 = body.shift(1), body.shift(2)
 
     #첫 번째 캔들
     first_bullish = c2 > o2
@@ -256,7 +256,7 @@ def is_evening_doji_star(df):
 '''
 
 def is_shooting_star(df):
-    uptrend = is_uptrend(df).shift(-1).fillna(False)
+    uptrend = is_uptrend(df).shift(1).fillna(False)
 
     o = df['시가']
     h = df['고가']
@@ -289,7 +289,7 @@ def is_shooting_star(df):
 '''
 
 def is_inverted_hammer(df):
-    downtrend = is_downtrend(df).shift(-1).fillna(False)
+    downtrend = is_downtrend(df).shift(1).fillna(False)
 
     o = df['시가']
     h = df['고가']
