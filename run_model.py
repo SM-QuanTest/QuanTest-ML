@@ -9,8 +9,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from dotenv import load_dotenv
 import os
-from sqlalchemy import create_engine
-from pathlib import Path
+from sqlalchemy import create_engine, text
+from pathlib import Path, PurePosixPath
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -254,28 +254,127 @@ class CEEMDAN11:
             raise ValueError("No IMF found. Please, run EMD method or its variant first.")
         return self.C_IMF, self.residue
 
-    # 아까 os.cpu 개수가 8이하면
-    # CEEMDAN11(trials=trials,iter_imf=num, parallel=True, processes=8)
-    # 여기서 processed=개수만 네 cpu 개수 이하로 설정해주면 돼 많을수록 빨라 (20)
-    def CEEMDREAL(S, num):
+# 아까 os.cpu 개수가 8이하면
+# CEEMDAN11(trials=trials,iter_imf=num, parallel=True, processes=8)
+# 여기서 processed=개수만 네 cpu 개수 이하로 설정해주면 돼 많을수록 빨라 (20)
+def CEEMDREAL(S, num):
+    # Logging options
+    logging.basicConfig(level=logging.INFO)
 
-        # Logging options
-        logging.basicConfig(level=logging.INFO)
+    max_imf = -1
 
-        max_imf = -1
+    # Signal options
+    N = len(S)
+    tMin, tMax = 0, N
+    T = np.linspace(tMin, tMax, N)
 
-        # Signal options
-        N = len(S)
-        tMin, tMax = 0, N
-        T = np.linspace(tMin, tMax, N)
+    # Prepare and run EEMD
+    trials = 100
+    ceemdan = CEEMDAN11(trials=trials, iter_imf=num, parallel=True, processes=10)
 
-        # Prepare and run EEMD
-        trials = 100
-        ceemdan = CEEMDAN11(trials=trials, iter_imf=num, parallel=True, processes=10)
+    return ceemdan(S, T, max_imf)
 
-        return ceemdan(S, T, max_imf)
+
+# 윈도우 크기
+window_size = 250
+step_size = 1
+imf_k = 7
+
+PROJECT_OUTPUT = os.environ.get("PROJECT_OUTPUT", "/app/bin")
+out_dir = Path(PROJECT_OUTPUT)
+out_dir.mkdir(parents=True, exist_ok=True)
+
+print("PROJECT_OUTPUT:", repr(PROJECT_OUTPUT))
+print("exists:", out_dir.exists())
+print("isdir:", out_dir.is_dir())
+
+
+def load_charts_joined(engine, window_size: int) -> pd.DataFrame:
+
+    sql = text("""
+               WITH eligible AS (SELECT stock_id
+                                 FROM public.charts
+                                 GROUP BY stock_id
+                                 HAVING COUNT(*) >= :ws)
+               SELECT c.stock_id,
+                      s.ticker,
+                      c.chart_date,
+                      c.chart_open,
+                      c.chart_high,
+                      c.chart_low,
+                      c.chart_close,
+                      c.chart_volume
+               FROM public.charts c
+                        JOIN eligible e ON e.stock_id = c.stock_id
+                        LEFT JOIN public.stocks s ON s.id = c.stock_id
+               ORDER BY c.stock_id, c.chart_date ASC
+               """)
+    with engine.begin() as conn:
+        df = pd.read_sql_query(sql, conn, params={"ws": window_size})
+    return df
+
+
+def to_npz_from_db(engine):
+    df = load_charts_joined(engine, window_size)
+
+    if df.empty:
+        print("charts 테이블에 window_size 이상 행을 가진 종목이 없습니다.")
+        return
+
+    # 필요한 컬럼만 사용, 중복/결측 처리
+    need_cols = [
+        "stock_id", "chart_date", "ticker",
+        "chart_open", "chart_high", "chart_low", "chart_close", "chart_volume"
+    ]
+    df = df[need_cols].copy()
+
+    # 종목별 처리
+    #  TODO: db에 data 다운 시 결측값 처리 어떻게?
+    for i, (stock_id, sub) in enumerate(df.groupby("stock_id", sort=False), 1):
+        ticker = (sub["ticker"].iloc[0]
+                  if "ticker" in sub and pd.notna(sub["ticker"].iloc[0])
+                  else f"ID{stock_id}")
+        print(f"[{i}/{df['stock_id'].nunique()}] stock_id={stock_id} ({ticker})")
+
+        # 날짜 오름차순 정렬은 되어 있음. 최신 250개만 사용
+        if len(sub) < window_size:
+            print(f"[SKIP] stock_id={stock_id} ({ticker}) length={len(sub)} < {window_size}")
+            continue
+
+        recent = sub.tail(window_size)
+        # 파일명에 넣을 날짜(마지막 날짜 사용)
+        last_date = pd.to_datetime(recent["chart_date"].iloc[-1]).date()
+        date_str = last_date.strftime("%Y%m%d")
+
+        data_mat = recent[["chart_open", "chart_high", "chart_low", "chart_close", "chart_volume"]].to_numpy()
+
+        # 열(총 5개)에 대해 CEEMD
+        procNPZ = []
+        for col_idx in range(5):
+            print(f"  Processing column {col_idx + 1}...")
+            # 해당 열의 데이터 추출
+            col_data = data_mat[:, col_idx]
+
+            try:
+                imfs = CEEMDREAL(col_data, imf_k)
+                procNPZ.append(imfs)
+            except Exception as e:
+                print(f"    Error processing stock_id={stock_id}, col={col_idx}: {e}")
+                continue
+
+        # 저장
+        out_path = out_dir / f"{ticker}_{date_str}.npz"
+        np.savez_compressed(out_path, imfs=procNPZ)
+        print("Saved:", out_path.resolve())
+
+        np.savez(out_path, imfs=procNPZ)
+        print(f"Saved: {out_path}")
+
+    print("All stocks processed from DB!")
 
 
 if __name__ == "__main__":
     print(os.cpu_count())  # 결과값이 8이상이 면 이후 코드에 조정 필요함!! -> 20
     print(DB_URL)
+
+    to_npz_from_db(engine)
