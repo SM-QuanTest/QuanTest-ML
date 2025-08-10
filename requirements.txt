@@ -1,0 +1,8 @@
+numpy
+pandas
+PyEMD
+EMD-signal
+dotenv
+sqlalchemy
+pathlib
+psycopg2-binary

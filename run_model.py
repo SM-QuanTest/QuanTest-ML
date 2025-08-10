@@ -7,6 +7,20 @@ from multiprocessing import Pool
 from tqdm import tqdm
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+from dotenv import load_dotenv
+import os
+from sqlalchemy import create_engine
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+DB_URL = os.getenv("DOCKER_DB_URL")
+
+engine = create_engine(
+    DB_URL,
+    pool_pre_ping=True,
+    future=True
+)
 
 # print(os.cpu_count())#결과값이 8이상이 면 이후 코드에 조정 필요함!!
 
@@ -264,3 +278,4 @@ class CEEMDAN11:
 
 if __name__ == "__main__":
     print(os.cpu_count())  # 결과값이 8이상이 면 이후 코드에 조정 필요함!! -> 20
+    print(DB_URL)
