@@ -1,0 +1,6 @@
+# Default ignored files
+.idea/shelf/
+.idea/workspace.xml
+
+/ceemd_model/ceemd_model.pth
+/ceemd_model/scalers.pkl
