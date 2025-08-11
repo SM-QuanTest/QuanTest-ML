@@ -11,11 +11,14 @@ from dotenv import load_dotenv
 import os
 from sqlalchemy import create_engine, text
 from pathlib import Path, PurePosixPath
+from psycopg2.extras import execute_values
 
 import torch
 import torch.nn as nn
 import pickle
 from datetime import datetime
+
+from typing import Tuple, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -26,9 +29,6 @@ engine = create_engine(
     pool_pre_ping=True,
     future=True
 )
-
-# print(os.cpu_count())#결과값이 8이상이 면 이후 코드에 조정 필요함!!
-
 
 class CEEMDAN11:
     logger = logging.getLogger(__name__)
@@ -449,8 +449,12 @@ class CEEMDEnsembleModel(nn.Module):
 
         return output.squeeze()
 
+MODEL_PATH = os.getenv('MODEL_PATH', '/app/ceemd_model/ceemd_model.pth')
+SCALERS_PATH = os.getenv('SCALERS_PATH', '/app/ceemd_model/scalers.pkl')
+
+
 # ============ 모델 로드 함수 ============
-def load_model_and_scalers(model_path='ceemd_model.pth', scalers_path='scalers.pkl'):
+def load_model_and_scalers(model_path=MODEL_PATH, scalers_path=SCALERS_PATH):
     """
     저장된 모델과 스케일러를 불러오는 함수
     """
@@ -619,13 +623,94 @@ def predict_from_npz(npz_path, current_prices, model, scalers_X, scaler_Y):
 
     return results
 
+def parse_file_key(p: Path):
+
+    stem = p.stem
+    parts = stem.split("_")
+
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError(f"파일명에서 날짜 파싱 실패: {p.name}")
+    chart_date = pd.to_datetime(parts[1], format="%Y%m%d").date()
+    return ticker, chart_date
+
+def collect_keys(output_dir: str) -> pd.DataFrame:
+    files = sorted(Path(output_dir).glob("*.npz"))
+    rows = []
+    for f in files:
+        try:
+            t, d = parse_file_key(f)
+            rows.append({"path": str(f), "ticker": t, "chart_date": d})
+        except Exception as e:
+            print(f"[SKIP] {f.name} - {e}")
+    return pd.DataFrame(rows)
+
+
+def resolve_chart_ids(engine, keys_df: pd.DataFrame) -> pd.DataFrame:
+    if keys_df.empty:
+        return keys_df.assign(chart_id=pd.NA, current_price=pd.NA)
+
+    values_sql = []
+    params = {}
+    for i, row in keys_df.reset_index(drop=True).iterrows():
+        values_sql.append(f"(:t{i}, :d{i})")
+        params[f"t{i}"] = row["ticker"]
+        params[f"d{i}"] = row["chart_date"]
+
+    sql = text(f"""
+        WITH keys(ticker, chart_date) AS (
+            VALUES {", ".join(values_sql)}
+        )
+        SELECT k.ticker, k.chart_date, c.id AS chart_id, c.chart_close AS current_price
+        FROM keys k
+        JOIN public.stocks s ON s.ticker = k.ticker
+        JOIN public.charts c ON c.stock_id = s.id AND c.chart_date = k.chart_date
+    """)
+    with engine.begin() as conn:
+        df_map = pd.read_sql_query(sql, conn, params=params)
+
+    return keys_df.merge(df_map, on=["ticker","chart_date"], how="left")
+
+
+def save_records(engine, input_df:pd.DataFrame) -> pd.DataFrame:
+
+    df = input_df.copy()
+
+    records = df[[
+        'chart_id', 'record_direction', 'record_prediction'
+    ]].itertuples(index=False, name=None)
+
+    sql = text("""
+               INSERT INTO public.records (chart_id,
+                                           record_direction,
+                                           record_prediction)
+               VALUES %s ON CONFLICT
+               ON CONSTRAINT chart_id_unique
+                   DO NOTHING
+                   RETURNING (xmax = 0) AS inserted;
+               """)
+
+    with engine.begin() as conn:
+        cur = conn.connection.cursor()
+        execute_values(cur, sql.text, records)
+
+        # RETURNING 결과가 있을 때만 fetch
+        if cur.description is not None:
+            results = cur.fetchall()
+            inserted = sum(r[0] for r in results)
+            updated = len(results) - inserted
+        else:
+            inserted = 0
+            updated = 0
+
+        print(f">>> 삽입: {inserted}건, >>> 갱신: {updated}건")
+
 # ============ 메인 사용 예제 ============
 def main():
     # 1. 모델과 스케일러 로드
     print("Loading model and scalers...")
     model, scalers_X, scaler_Y = load_model_and_scalers(
-        model_path='/content/drive/MyDrive/BK21_2/ceemd_model.pth',
-        scalers_path='/content/drive/MyDrive/BK21_2/scalers.pkl'
+        model_path=MODEL_PATH,
+        scalers_path=SCALERS_PATH
     )
 
     # 2. 새로운 데이터로 예측 (예제)
@@ -633,7 +718,7 @@ def main():
     print("예측 시작")
     print("="*50)
 
-    # 옵션 1: npz 파일에서 X 데이터 로드하여 예측
+    """# 옵션 1: npz 파일에서 X 데이터 로드하여 예측
     npz_path = '/content/drive/MyDrive/BK21_2/코스닥전종목/processed/A000440_processed.npz'
     current_price = 1000.0  # 현재 주가 (예시)
 
@@ -643,38 +728,86 @@ def main():
         model=model,
         scalers_X=scalers_X,
         scaler_Y=scaler_Y
-    )
+    )"""
 
-    # 3. 결과 저장 (선택사항)
-    output_path = '/content/drive/MyDrive/BK21_2/predictions.npz'
-    np.savez(
-        output_path,
-        predicted_prices=results['predicted_prices'],
-        predicted_returns=results['predicted_returns'],
-        current_prices=results['current_prices'],
-        timestamp=datetime.now().isoformat()
-    )
-    print(f"\n예측 결과 저장 완료: {output_path}")
+    keys_df = collect_keys(PROJECT_OUTPUT)
+    if keys_df.empty:
+        print("예측할 .npz 파일이 없습니다.")
+        return
+
+    keys_df = resolve_chart_ids(engine, keys_df)
+
+    # 매핑 실패한 파일 로그
+    missing = keys_df[keys_df["chart_id"].isna()]
+    if not missing.empty:
+        print("\n[WARN] 매핑 실패(차트 행 없음):")
+        print(missing[["path", "ticker", "chart_date"]].head(20))
+        print(f"... 총 {len(missing)}개 파일 스킵")
+
+    ok_df = keys_df.dropna(subset=["chart_id"]).copy()
+
+    all_rows = []
+    for _, row in ok_df.iterrows():
+        npz_path = row["path"]
+        cur_price = float(row["current_price"])
+        res = predict_from_npz(
+            npz_path=npz_path,
+            current_prices=cur_price,
+            model=model,
+            scalers_X=scalers_X,
+            scaler_Y=scaler_Y
+        )
+
+        df = pd.DataFrame({
+            "chart_id": row["chart_id"],
+            "record_prediction": res['predicted_returns'] * 100,
+            'record_direction': ['u' if r > 0.02 else 'd' if r < -0.02 else 'n'
+                   for r in res['predicted_returns']]
+        })
+        all_rows.append(df)
+
+    if not all_rows:
+        print("예측 결과가 없습니다.")
+        return
+
+
+    # # 3. 결과 저장 (선택사항)
+    # output_path = '/content/drive/MyDrive/BK21_2/predictions.npz'
+    # np.savez(
+    #     output_path,
+    #     predicted_prices=results['predicted_prices'],
+    #     predicted_returns=results['predicted_returns'],
+    #     current_prices=results['current_prices'],
+    #     timestamp=datetime.now().isoformat()
+    # )
+    # print(f"\n예측 결과 저장 완료: {output_path}")
 
     # 4. 결과를 DataFrame으로 변환 (선택사항)
-    df_results = pd.DataFrame({
-        'current_price': results['current_prices'],
-        'predicted_price': results['predicted_prices'],
-        'predicted_return(%)': results['predicted_returns'] * 100,
-        'signal': ['BUY' if r > 0.02 else 'SELL' if r < -0.02 else 'HOLD'
-                   for r in results['predicted_returns']]
-    })
+    # df_results = pd.DataFrame({
+    #     'current_price': results['current_prices'],
+    #     'predicted_price': results['predicted_prices'],
+    #     'predicted_return(%)': results['predicted_returns'] * 100,
+    #     'signal': ['BUY' if r > 0.02 else 'SELL' if r < -0.02 else 'HOLD'
+    #                for r in results['predicted_returns']]
+    # })
 
+    df_all = pd.concat(all_rows, ignore_index=True)
     print("\n예측 결과 요약:")
-    print(df_results.head(10))
+    print(df_all[["chart_id", "record_prediction", "record_direction"]].head(10))
 
-    # CSV로 저장 (선택사항)
-    csv_path = '/content/drive/MyDrive/BK21_2/predictions.csv'
-    df_results.to_csv(csv_path, index=False)
-    print(f"CSV 저장 완료: {csv_path}")
+    # db 저장
+    save_records(engine, df_all)
 
-    return results, df_results
+    # # CSV로 저장 (선택사항)
+    # csv_path = '/content/drive/MyDrive/BK21_2/predictions.csv'
+    # df_results.to_csv(csv_path, index=False)
+    # print(f"CSV 저장 완료: {csv_path}")
 
+    # return results, df_results
+    # return df_results
+
+
+'''
 # ============ 실시간 예측 예제 ============
 def predict_realtime_example():
     """
@@ -719,6 +852,7 @@ def predict_realtime_example():
         except KeyboardInterrupt:
             print("\n예측 종료")
             break
+'''
 
 
 
@@ -731,3 +865,5 @@ if __name__ == "__main__":
     # GPU 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    main()

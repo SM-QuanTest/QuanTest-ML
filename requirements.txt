@@ -6,3 +6,4 @@ dotenv
 sqlalchemy
 pathlib
 psycopg2-binary
+scikit-learn
