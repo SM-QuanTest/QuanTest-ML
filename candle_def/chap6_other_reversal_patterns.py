@@ -419,7 +419,7 @@ def is_three_river(df):
 
 '''
 
-#상승반격형 (하락반전신호)
+#상승반격형 (상승반전신호)
 def is_counterattack_lines_after_downtrend(df):
 
   downtrend = is_downtrend(df).shift(1).fillna(False)

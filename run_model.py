@@ -16,7 +16,8 @@ from psycopg2.extras import execute_values
 import torch
 import torch.nn as nn
 import pickle
-from datetime import datetime
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 from typing import Tuple, Optional
 
@@ -369,11 +370,10 @@ def to_npz_from_db(engine):
 
         # 저장
         out_path = out_dir / f"{ticker}_{date_str}.npz"
-        np.savez_compressed(out_path, imfs=procNPZ)
-        print("Saved:", out_path.resolve())
+        # np.savez_compressed(out_path, imfs=procNPZ)
+        np.savez_compressed(out_path, imfs=np.stack(procNPZ, axis=0).astype(np.float32))
 
-        np.savez(out_path, imfs=procNPZ)
-        print(f"Saved: {out_path}")
+        print("Saved:", out_path.resolve())
 
     print("All stocks processed from DB!")
 
@@ -630,16 +630,18 @@ def parse_file_key(p: Path):
 
     if len(parts) < 2 or not parts[1].isdigit():
         raise ValueError(f"파일명에서 날짜 파싱 실패: {p.name}")
+    ticker = parts[0]
     chart_date = pd.to_datetime(parts[1], format="%Y%m%d").date()
     return ticker, chart_date
 
-def collect_keys(output_dir: str) -> pd.DataFrame:
+def collect_keys(output_dir: str, target_date: date | None = None) -> pd.DataFrame:
     files = sorted(Path(output_dir).glob("*.npz"))
     rows = []
     for f in files:
         try:
             t, d = parse_file_key(f)
-            rows.append({"path": str(f), "ticker": t, "chart_date": d})
+            if target_date is None or d == target_date:
+                rows.append({"path": str(f), "ticker": t, "chart_date": d})
         except Exception as e:
             print(f"[SKIP] {f.name} - {e}")
     return pd.DataFrame(rows)
@@ -691,7 +693,7 @@ def save_records(engine, input_df:pd.DataFrame) -> pd.DataFrame:
 
     with engine.begin() as conn:
         cur = conn.connection.cursor()
-        execute_values(cur, sql.text, records)
+        execute_values(cur, sql.text, records, page_size=1000)
 
         # RETURNING 결과가 있을 때만 fetch
         if cur.description is not None:
@@ -730,7 +732,11 @@ def main():
         scaler_Y=scaler_Y
     )"""
 
-    keys_df = collect_keys(PROJECT_OUTPUT)
+    KST = ZoneInfo("Asia/Seoul")
+    # today_kst = datetime.now(KST).date()
+    today_kst = date(2025, 8, 4)
+
+    keys_df = collect_keys(PROJECT_OUTPUT, target_date=today_kst)
     if keys_df.empty:
         print("예측할 .npz 파일이 없습니다.")
         return
@@ -771,26 +777,6 @@ def main():
         return
 
 
-    # # 3. 결과 저장 (선택사항)
-    # output_path = '/content/drive/MyDrive/BK21_2/predictions.npz'
-    # np.savez(
-    #     output_path,
-    #     predicted_prices=results['predicted_prices'],
-    #     predicted_returns=results['predicted_returns'],
-    #     current_prices=results['current_prices'],
-    #     timestamp=datetime.now().isoformat()
-    # )
-    # print(f"\n예측 결과 저장 완료: {output_path}")
-
-    # 4. 결과를 DataFrame으로 변환 (선택사항)
-    # df_results = pd.DataFrame({
-    #     'current_price': results['current_prices'],
-    #     'predicted_price': results['predicted_prices'],
-    #     'predicted_return(%)': results['predicted_returns'] * 100,
-    #     'signal': ['BUY' if r > 0.02 else 'SELL' if r < -0.02 else 'HOLD'
-    #                for r in results['predicted_returns']]
-    # })
-
     df_all = pd.concat(all_rows, ignore_index=True)
     print("\n예측 결과 요약:")
     print(df_all[["chart_id", "record_prediction", "record_direction"]].head(10))
@@ -798,69 +784,13 @@ def main():
     # db 저장
     save_records(engine, df_all)
 
-    # # CSV로 저장 (선택사항)
-    # csv_path = '/content/drive/MyDrive/BK21_2/predictions.csv'
-    # df_results.to_csv(csv_path, index=False)
-    # print(f"CSV 저장 완료: {csv_path}")
-
-    # return results, df_results
-    # return df_results
-
-
-'''
-# ============ 실시간 예측 예제 ============
-def predict_realtime_example():
-    """
-    실시간으로 들어오는 데이터에 대한 예측 예제
-    """
-    # 모델 로드
-    model, scalers_X, scaler_Y = load_model_and_scalers(
-        model_path='/content/drive/MyDrive/BK21_2/ceemd_model.pth',
-        scalers_path='/content/drive/MyDrive/BK21_2/scalers.pkl'
-    )
-
-    # 실시간 데이터 시뮬레이션 (실제로는 API나 스트림에서 받아옴)
-    while True:
-        try:
-            # 새로운 데이터 생성 (실제로는 실시간 데이터)
-            new_X = np.random.randn(1, 5, 8, 250)  # 예시
-            current_price = 1050.0  # 현재가
-
-            # 예측
-            pred_price, pred_return = predict_single(
-                new_X[0], current_price, model, scalers_X, scaler_Y
-            )
-
-            # 결과 출력
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                  f"현재가: {current_price:.2f} → "
-                  f"예측가: {pred_price:.2f} "
-                  f"(수익률: {pred_return*100:+.2f}%)")
-
-            # 매매 신호
-            if pred_return > 0.03:
-                print("  📈 강한 매수 신호!")
-            elif pred_return > 0.01:
-                print("  ↗️ 매수 신호")
-            elif pred_return < -0.03:
-                print("  📉 강한 매도 신호!")
-            elif pred_return < -0.01:
-                print("  ↘️ 매도 신호")
-            else:
-                print("  ➡️ 관망")
-
-        except KeyboardInterrupt:
-            print("\n예측 종료")
-            break
-'''
-
 
 
 if __name__ == "__main__":
     print(os.cpu_count())  # 결과값이 8이상이 면 이후 코드에 조정 필요함!! -> 20
     print(DB_URL)
 
-    # to_npz_from_db(engine)
+    to_npz_from_db(engine)
 
     # GPU 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
