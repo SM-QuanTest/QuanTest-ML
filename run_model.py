@@ -102,6 +102,10 @@ class CEEMDAN11:
     ) -> np.ndarray:
 
         scale_s = np.std(S)
+
+        if scale_s == 0:
+            scale_s = 1.0
+
         S = S / scale_s
 
         # Define all noise
