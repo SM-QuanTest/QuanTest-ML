@@ -300,6 +300,7 @@ print("isdir:", out_dir.is_dir())
 
 
 def load_charts_joined(engine, window_size: int) -> pd.DataFrame:
+    # ws개 이상 있는 데이터만 선별해서 주가데이터와 주식 정보 가져옴
 
     sql = text("""
                WITH eligible AS (SELECT stock_id
@@ -639,6 +640,7 @@ def parse_file_key(p: Path):
     return ticker, chart_date
 
 def collect_keys(output_dir: str, target_date: date | None = None) -> pd.DataFrame:
+    # bin에서 npz 확장자 가진 파일들
     files = sorted(Path(output_dir).glob("*.npz"))
     rows = []
     for f in files:
@@ -648,6 +650,8 @@ def collect_keys(output_dir: str, target_date: date | None = None) -> pd.DataFra
                 rows.append({"path": str(f), "ticker": t, "chart_date": d})
         except Exception as e:
             print(f"[SKIP] {f.name} - {e}")
+    ################################
+    print(pd.DataFrame(rows))
     return pd.DataFrame(rows)
 
 
@@ -737,8 +741,9 @@ def main():
     )"""
 
     KST = ZoneInfo("Asia/Seoul")
+    # TODO: date 변경
     # today_kst = datetime.now(KST).date()
-    today_kst = date(2025, 8, 4)
+    today_kst = date(2025, 8, 8)
 
     keys_df = collect_keys(PROJECT_OUTPUT, target_date=today_kst)
     if keys_df.empty:
@@ -791,10 +796,11 @@ def main():
 
 
 if __name__ == "__main__":
-    print(os.cpu_count())  # 결과값이 8이상이 면 이후 코드에 조정 필요함!! -> 20
+    print(os.cpu_count())
     print(DB_URL)
+    print("한글테스트")
 
-    to_npz_from_db(engine)
+    # to_npz_from_db(engine)
 
     # GPU 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
