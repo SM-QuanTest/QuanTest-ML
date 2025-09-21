@@ -6,6 +6,7 @@ from PyEMD import CEEMDAN
 from multiprocessing import Pool
 from tqdm import tqdm
 from typing import Dict, List, Optional, Sequence, Tuple, Union
+from sklearn.preprocessing import RobustScaler
 
 from dotenv import load_dotenv
 import os
@@ -31,272 +32,123 @@ engine = create_engine(
     future=True
 )
 
-class CEEMDAN11:
-    logger = logging.getLogger(__name__)
-
-    noise_kinds_all = ["normal", "uniform"]
-
-    def __init__(self, trials: int = 100, epsilon: float = 0.005, iter_imf: int = 9, ext_EMD=None,
-                 parallel: bool = False, **kwargs):
-        # Ensemble constants
-        self.trials = trials
-        self.epsilon = epsilon
-        self.noise_scale = float(kwargs.get("noise_scale", 1.0))
-        self.range_thr = float(kwargs.get("range_thr", 0.01))
-        self.total_power_thr = float(kwargs.get("total_power_thr", 0.05))
-        self.iter_imf = iter_imf
-
-        self.beta_progress = bool(kwargs.get("beta_progress", True))  # Scale noise by std
-        self.random = np.random.RandomState(seed=kwargs.get("seed"))
-        self.noise_kind = kwargs.get("noise_kind", "normal")
-
-        self._max_imf = int(kwargs.get("max_imf", 100))
-        self.parallel = parallel
-        self.processes = kwargs.get("processes")  # Optional[int]
-        if self.processes is not None and not self.parallel:
-            self.logger.warning("Passed value for process has no effect when `parallel` is False.")
-
-        self.all_noise_EMD = []
-
-        if ext_EMD is None:
-            from PyEMD import EMD  # fmt: skip
-            self.EMD = EMD(**kwargs)
-        else:
-            self.EMD = ext_EMD
-
-        self.C_IMF = None  # Optional[np.ndarray]
-        self.residue = None  # Optional[np.ndarray]
-
-    def __call__(
-            self, S: np.ndarray, T: Optional[np.ndarray] = None, max_imf: int = -1, progress: bool = False
-    ) -> np.ndarray:
-        return self.ceemdan(S, T=T, max_imf=max_imf, progress=progress)
-
-    def __getstate__(self) -> Dict:
-        self_dict = self.__dict__.copy()
-        if "pool" in self_dict:
-            del self_dict["pool"]
-        return self_dict
-
-    def generate_noise(self, scale: float, size: Union[int, Sequence[int]]) -> np.ndarray:
-
-        if self.noise_kind == "normal":
-            noise = self.random.normal(loc=0, scale=scale, size=size)
-        elif self.noise_kind == "uniform":
-            noise = self.random.uniform(low=-scale / 2, high=scale / 2, size=size)
-        else:
-            raise ValueError(
-                "Unsupported noise kind. Please assigned `noise_kind` to be one of these: {0}".format(
-                    str(self.noise_kinds_all)
-                )
-            )
-
-        return noise
-
-    def noise_seed(self, seed: int) -> None:
-        """Set seed for noise generation."""
-        self.random.seed(seed)
-
-    def ceemdan(
-            self, S: np.ndarray, T: Optional[np.ndarray] = None, max_imf: int = -1, progress: bool = False
-    ) -> np.ndarray:
-
-        scale_s = np.std(S)
-
-        if scale_s == 0:
-            scale_s = 1.0
-
-        S = S / scale_s
-
-        # Define all noise
-        self.all_noises = self.generate_noise(self.noise_scale, (self.trials, S.size))
-
-        # Decompose all noise and remember 1st's std
-        self.logger.debug("Decomposing all noises")
-        self.all_noise_EMD = self._decompose_noise()
-
-        # Create first IMF
-        last_imf = self._eemd(S, T, max_imf=1, progress=progress)[0]
-        res = np.empty(S.size)
-
-        all_cimfs = last_imf.reshape((-1, last_imf.size))
-        prev_res = S - last_imf
-
-        self.logger.debug("Starting CEEMDAN")
-        total = (max_imf - 1) if max_imf != -1 else None
-        it = iter if not progress else lambda x: tqdm(x, desc="cIMF decomposition", total=total)
-        for _ in it(range(self._max_imf)):
-            # Check end condition in the beginning because we've already have 1 IMF
-            if self.end_condition(S, all_cimfs, max_imf):
-                self.logger.debug("End Condition - Pass")
-                break
-
-            imfNo = all_cimfs.shape[0]
-            beta = self.epsilon * np.std(prev_res)
-
-            local_mean = np.zeros(S.size)
-            for trial in range(self.trials):
-                # Skip if noise[trial] didn't have k'th mode
-                noise_imf = self.all_noise_EMD[trial]
-                res = prev_res.copy()
-                if len(noise_imf) > imfNo:
-                    res += beta * noise_imf[imfNo]
-
-                # Extract local mean, which is at 2nd position
-                imfs = self.emd(res, T, max_imf=1)
-                local_mean += imfs[-1] / self.trials
-
-            last_imf = prev_res - local_mean
-            all_cimfs = np.vstack((all_cimfs, last_imf))
-            prev_res = local_mean.copy()
-        # END of while
-
-        res = S - np.sum(all_cimfs, axis=0)
-        all_cimfs = np.vstack((all_cimfs, res))
-        all_cimfs = all_cimfs * scale_s
-
-        # Empty all IMFs noise
-        del self.all_noise_EMD[:]
-
-        self.C_IMF = all_cimfs
-        self.residue = S * scale_s - np.sum(self.C_IMF, axis=0)
-
-        return all_cimfs
-
-    def end_condition(self, S: np.ndarray, cIMFs: np.ndarray, max_imf: int) -> bool:
-        """Test for end condition of CEEMDAN.
-
-        Procedure stops if:
-
-        * number of components reach provided `max_imf`, or
-        * last component is close to being pure noise (range or power), or
-        * set of provided components reconstructs sufficiently input.
-
-        Parameters
-        ----------
-        S : numpy array
-            Original signal on which CEEMDAN was performed.
-        cIMFs : numpy 2D array
-            Set of cIMFs where each row is cIMF.
-        max_imf : int
-            The maximum number of imfs to extract.
-
-        Returns
-        -------
-        end : bool
-            Whether to stop CEEMDAN.
-        """
-        imfNo = cIMFs.shape[0]
-
-        # Check if hit maximum number of cIMFs
-        # 차원 수 맞춰야 하므로 개수만 기준으로 바꿈
-        if self.iter_imf <= imfNo:
-            return True
-        else:
-            return False
-
-    def _decompose_noise(self) -> List[np.ndarray]:
-        if self.parallel:
-            pool = Pool(processes=self.processes)
-            all_noise_EMD = pool.map(self.emd, self.all_noises)
-            pool.close()
-        else:
-            all_noise_EMD = [self.emd(noise, max_imf=-1) for noise in self.all_noises]
-
-        # Normalize w/ respect to 1st IMF's std
-        if self.beta_progress:
-            all_stds = [np.std(imfs[0]) for imfs in all_noise_EMD]
-            all_noise_EMD = [imfs / imfs_std for (imfs, imfs_std) in zip(all_noise_EMD, all_stds)]
-
-        return all_noise_EMD
-
-    def _eemd(self, S: np.ndarray, T: Optional[np.ndarray] = None, max_imf: int = -1, progress=True) -> np.ndarray:
-        if T is None:
-            T = np.arange(len(S), dtype=S.dtype)
-
-        self._S = S
-        self._T = T
-        self._N = N = len(S)
-        self.max_imf = max_imf
-
-        # For trial number of iterations perform EMD on a signal
-        # with added white noise
-        if self.parallel:
-            pool = Pool(processes=self.processes)
-            map_pool = pool.imap_unordered
-        else:  # Not parallel
-            map_pool = map
-
-        self.E_IMF = np.zeros((1, N))
-        it = iter if not progress else lambda x: tqdm(x, desc="Decomposing noise", total=self.trials)
-
-        for IMFs in it(map_pool(self._trial_update, range(self.trials))):
-            if self.E_IMF.shape[0] < IMFs.shape[0]:
-                num_new_layers = IMFs.shape[0] - self.E_IMF.shape[0]
-                self.E_IMF = np.vstack((self.E_IMF, np.zeros(shape=(num_new_layers, N))))
-            self.E_IMF[: IMFs.shape[0]] += IMFs
-
-        if self.parallel:
-            pool.close()
-
-        return self.E_IMF / self.trials
-
-    def _trial_update(self, trial: int) -> np.ndarray:
-        """A single trial evaluation, i.e. EMD(signal + noise)."""
-        # Generate noise
-        noise = self.epsilon * self.all_noise_EMD[trial][0]
-        return self.emd(self._S + noise, self._T, self.max_imf)
-
-    def emd(self, S: np.ndarray, T: Optional[np.ndarray] = None, max_imf: int = -1) -> np.ndarray:
-        """Vanilla EMD method.
-
-        Provides emd evaluation from provided EMD class.
-        For reference please see :class:`PyEMD.EMD`.
-        """
-        return self.EMD.emd(S, T, max_imf=max_imf)
-
-    def get_imfs_and_residue(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Provides access to separated imfs and residue from recently analysed signal.
-        :return: (imfs, residue)
-        """
-        if self.C_IMF is None or self.residue is None:
-            raise ValueError("No IMF found. Please, run EMD method or its variant first.")
-        return self.C_IMF, self.residue
-
-# 아까 os.cpu 개수가 8이하면
-# CEEMDAN11(trials=trials,iter_imf=num, parallel=True, processes=8)
-# 여기서 processed=개수만 네 cpu 개수 이하로 설정해주면 돼 많을수록 빨라 (20)
-def CEEMDREAL(S, num):
-    # Logging options
-    logging.basicConfig(level=logging.INFO)
-
-    max_imf = -1
-
-    # Signal options
-    N = len(S)
-    tMin, tMax = 0, N
-    T = np.linspace(tMin, tMax, N)
-
-    # Prepare and run EEMD
-    trials = 100
-    ceemdan = CEEMDAN11(trials=trials, iter_imf=num, parallel=True, processes=16)
-
-    return ceemdan(S, T, max_imf)
+class Config:
+    """모델 설정"""
+    # 모델 설정
+    INPUT_DIM = 15
+    SEQUENCE_LENGTH = 250
+    VGG1_CHANNELS = [32, 64, 128]
+    VGG2_CHANNELS = [256, 256, 512]
+    LSTM_HIDDEN_SIZE = 128
+    LSTM_NUM_LAYERS = 2
+    LSTM_DROPOUT = 0.3
+    LSTM_BIDIRECTIONAL = True
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# 윈도우 크기
-window_size = 250
-step_size = 1
-imf_k = 7
+# VGG-LSTM 모델 클래스 정의
+class VGGBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
+        super(VGGBlock, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.conv3 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.bn3 = nn.BatchNorm1d(out_channels)
+        self.pool = nn.MaxPool1d(2, stride=2)
 
-PROJECT_OUTPUT = os.environ.get("PROJECT_OUTPUT", "/app/bin")
-out_dir = Path(PROJECT_OUTPUT)
-out_dir.mkdir(parents=True, exist_ok=True)
+    def forward(self, x):
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x)
+        return x
 
-print("PROJECT_OUTPUT:", repr(PROJECT_OUTPUT))
-print("exists:", out_dir.exists())
-print("isdir:", out_dir.is_dir())
+
+class VGG_LSTM_Model(nn.Module):
+    def __init__(self, config: Config):
+        super(VGG_LSTM_Model, self).__init__()
+
+        self.vgg1_blocks = nn.ModuleList([
+            VGGBlock(config.INPUT_DIM if i == 0 else config.VGG1_CHANNELS[i - 1],
+                     config.VGG1_CHANNELS[i])
+            for i in range(len(config.VGG1_CHANNELS))
+        ])
+
+        self.vgg2_blocks = nn.ModuleList([
+            VGGBlock(config.VGG1_CHANNELS[-1] if i == 0 else config.VGG2_CHANNELS[i - 1],
+                     config.VGG2_CHANNELS[i])
+            for i in range(len(config.VGG2_CHANNELS))
+        ])
+
+        lstm_input_size = config.VGG2_CHANNELS[-1]
+        lstm_output_size = config.LSTM_HIDDEN_SIZE * (2 if config.LSTM_BIDIRECTIONAL else 1)
+
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_size,
+            hidden_size=config.LSTM_HIDDEN_SIZE,
+            num_layers=config.LSTM_NUM_LAYERS,
+            dropout=config.LSTM_DROPOUT,
+            batch_first=True,
+            bidirectional=config.LSTM_BIDIRECTIONAL
+        )
+
+        self.bn_lstm = nn.BatchNorm1d(lstm_output_size)
+
+        self.dropout = nn.Dropout(config.LSTM_DROPOUT)
+        self.fc1 = nn.Linear(lstm_output_size, 64)
+        self.bn_fc = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+
+        for block in self.vgg1_blocks:
+            x = block(x)
+
+        for block in self.vgg2_blocks:
+            x = block(x)
+
+        x = x.transpose(1, 2)
+        lstm_out, _ = self.lstm(x)
+        x = lstm_out[:, -1, :]
+        x = self.bn_lstm(x)
+        x = self.dropout(x)
+        x = self.fc1(x)
+        x = self.bn_fc(x)
+        x = torch.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+
+        return x.squeeze()
+
+
+class EnsembleModel:
+    """앙상블 모델"""
+
+    def __init__(self, models: List[nn.Module], config: Config):
+        self.models = models
+        self.config = config
+
+    def predict_proba(self, X: torch.Tensor) -> np.ndarray:
+        predictions = []
+
+        for model in self.models:
+            model.eval()
+            with torch.no_grad():
+                X_device = X.to(self.config.DEVICE)
+                outputs = model(X_device)
+                predictions.append(outputs.cpu().numpy())
+
+        ensemble_proba = np.mean(predictions, axis=0)
+        return ensemble_proba
+
+    def predict(self, X: torch.Tensor) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return (proba > 0.5).astype(int)
 
 
 def load_charts_joined(engine, window_size: int) -> pd.DataFrame:
@@ -325,180 +177,121 @@ def load_charts_joined(engine, window_size: int) -> pd.DataFrame:
     return df
 
 
-def to_npz_from_db(engine):
-    df = load_charts_joined(engine, window_size)
-
-    if df.empty:
-        print("charts 테이블에 window_size 이상 행을 가진 종목이 없습니다.")
-        return
-
-    # 필요한 컬럼만 사용, 중복/결측 처리
-    need_cols = [
-        "stock_id", "chart_date", "ticker",
-        "chart_open", "chart_high", "chart_low", "chart_close", "chart_volume"
-    ]
-    df = df[need_cols].copy()
-
-    # 종목별 처리
-    #  TODO: db에 data 다운 시 결측값 처리 어떻게?
-    for i, (stock_id, sub) in enumerate(df.groupby("stock_id", sort=False), 1):
-        ticker = (sub["ticker"].iloc[0]
-                  if "ticker" in sub and pd.notna(sub["ticker"].iloc[0])
-                  else f"ID{stock_id}")
-        print(f"[{i}/{df['stock_id'].nunique()}] stock_id={stock_id} ({ticker})")
-
-        # 날짜 오름차순 정렬은 되어 있음. 최신 250개만 사용
-        if len(sub) < window_size:
-            print(f"[SKIP] stock_id={stock_id} ({ticker}) length={len(sub)} < {window_size}")
-            continue
-
-        recent = sub.tail(window_size)
-        # 파일명에 넣을 날짜(마지막 날짜 사용)
-        last_date = pd.to_datetime(recent["chart_date"].iloc[-1]).date()
-        date_str = last_date.strftime("%Y%m%d")
-
-        data_mat = recent[["chart_open", "chart_high", "chart_low", "chart_close", "chart_volume"]].to_numpy()
-
-        # 열(총 5개)에 대해 CEEMD
-        procNPZ = []
-        for col_idx in range(5):
-            print(f"  Processing column {col_idx + 1}...")
-            # 해당 열의 데이터 추출
-            col_data = data_mat[:, col_idx]
-
-            try:
-                imfs = CEEMDREAL(col_data, imf_k)
-                procNPZ.append(imfs)
-            except Exception as e:
-                print(f"    Error processing stock_id={stock_id}, col={col_idx}: {e}")
-                continue
-
-        # 저장
-        out_path = out_dir / f"{ticker}_{date_str}.npz"
-        # np.savez_compressed(out_path, imfs=procNPZ)
-        np.savez_compressed(out_path, imfs=np.stack(procNPZ, axis=0).astype(np.float32))
-
-        print("Saved:", out_path.resolve())
-
-    print("All stocks processed from DB!")
-
-
-# ============ 모델 클래스 정의 (동일하게 유지) ============
-class CNNLSTMModule(nn.Module):
-    def __init__(self, input_channels=5, cnn_filters=512, lstm_hidden=200, seq_length=250):
-        super(CNNLSTMModule, self).__init__()
-
-        # CNN layers
-        self.conv1 = nn.Conv1d(input_channels, cnn_filters//4, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(cnn_filters//4, cnn_filters//2, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(cnn_filters//2, cnn_filters, kernel_size=3, padding=1)
-
-        self.pool = nn.MaxPool1d(2)
-        self.dropout = nn.Dropout(0.2)
-        self.relu = nn.ReLU()
-        self.batch_norm1 = nn.BatchNorm1d(cnn_filters//4)
-        self.batch_norm2 = nn.BatchNorm1d(cnn_filters//2)
-        self.batch_norm3 = nn.BatchNorm1d(cnn_filters)
-
-        # LSTM layer
-        self.lstm = nn.LSTM(cnn_filters, lstm_hidden, batch_first=True, bidirectional=True)
-
-    def forward(self, x):
-        x = self.relu(self.batch_norm1(self.conv1(x)))
-        x = self.pool(x)
-
-        x = self.relu(self.batch_norm2(self.conv2(x)))
-        x = self.pool(x)
-
-        x = self.relu(self.batch_norm3(self.conv3(x)))
-        x = self.pool(x)
-        x = self.dropout(x)
-
-        x = x.transpose(1, 2)
-
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        output = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
-
-        return output
-
-class CEEMDEnsembleModel(nn.Module):
-    def __init__(self, n_imfs=8, input_channels=5, cnn_filters=512, lstm_hidden=200, seq_length=250):
-        super(CEEMDEnsembleModel, self).__init__()
-
-        self.imf_modules = nn.ModuleList([
-            CNNLSTMModule(input_channels, cnn_filters, lstm_hidden, seq_length)
-            for _ in range(n_imfs)
-        ])
-
-        fusion_input_size = lstm_hidden * 2 * n_imfs
-        self.fusion_layers = nn.Sequential(
-            nn.Linear(fusion_input_size, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        imf_outputs = []
-
-        for i in range(8):
-            imf_data = x[:, :, i, :]
-            imf_out = self.imf_modules[i](imf_data)
-            imf_outputs.append(imf_out)
-
-        combined = torch.cat(imf_outputs, dim=1)
-        output = self.fusion_layers(combined)
-
-        return output.squeeze()
-
-MODEL_PATH = os.getenv('MODEL_PATH', '/app/ceemd_model/ceemd_model.pth')
-SCALERS_PATH = os.getenv('SCALERS_PATH', '/app/ceemd_model/scalers.pkl')
-
-
-# ============ 모델 로드 함수 ============
-def load_model_and_scalers(model_path=MODEL_PATH, scalers_path=SCALERS_PATH):
+def process_stock_data_for_prediction(df: pd.DataFrame, scalers: List[RobustScaler],
+                                      config: Config) -> Tuple[Optional[np.ndarray], Optional[pd.DataFrame], str]:
     """
-    저장된 모델과 스케일러를 불러오는 함수
+    주식 데이터를 처리하여 예측용 데이터 생성
+    Returns: (X_data, price_df, stock_name)
     """
-    # 모델 로드
-    model_info = torch.load(model_path, map_location=device, weights_only=False)
-    config = model_info['model_config']
+    try:
+        stock_name = df['ticker'].iloc[0] if 'ticker' in df.columns else f"STOCK_{df['stock_id'].iloc[0]}"
 
-    # 모델 초기화
-    model = CEEMDEnsembleModel(
-        n_imfs=config['n_imfs'],
-        input_channels=config['input_channels'],
-        cnn_filters=config['cnn_filters'],
-        lstm_hidden=config['lstm_hidden'],
-        seq_length=config['seq_length']
-    ).to(device)
+        # 날짜순 정렬
+        df = df.sort_values('chart_date')
 
-    # 가중치 로드
-    model.load_state_dict(model_info['state_dict'])
-    model.eval()
-    print(f"Model loaded from {model_path}")
+        # print("len(df):", len(df))
 
-    # 메트릭 출력 (있는 경우)
-    if 'metrics' in model_info:
-        print("Training performance:")
-        for metric, value in model_info['metrics'].items():
-            if metric == 'MAPE':
-                print(f"  {metric}: {value:.2f}%")
-            else:
-                print(f"  {metric}: {value:.4f}")
+        # 필수 컬럼 확인 및 이름 변경
+        df = df.rename(columns={
+            'chart_date': 'date',
+            'chart_open': 'open',
+            'chart_high': 'high',
+            'chart_low': 'low',
+            'chart_close': 'close',
+            'chart_volume': 'volume'
+        })
 
-    # 스케일러 로드
-    with open(scalers_path, 'rb') as f:
-        scalers_info = pickle.load(f)
+        # 날짜를 인덱스로 설정
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
 
-    scalers_X = scalers_info['scalers_X']
-    scaler_Y = scalers_info['scaler_Y']
-    print(f"Scalers loaded from {scalers_path}")
+        # total_days_needed = config.SEQUENCE_LENGTH + 60  # 250 + 105 = 355
+        # if len(df) > total_days_needed:
+        #    df = df.tail(total_days_needed)
+        # 처음 다운받아 전부 저장한 후에 매일 새로 들어오는 것 하나씩만 처리할 때는 켜기
 
-    return model, scalers_X, scaler_Y
+        # 원본 가격 데이터 저장
+        price_df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+
+        # 특성 생성
+        # 1. 차분값
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[f'{col}_diff'] = df[col].diff()
+
+        # 2. 변화율
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[f'{col}_pct'] = df[col].pct_change() * 100
+
+        # 3. 이격도
+        periods = [5, 10, 20, 40, 60]
+        for period in periods:
+            ma = df['close'].rolling(window=period).mean()
+            df[f'disp_{period}'] = (df['close'] / ma - 1) * 100
+
+        # 원래 OHLCV 컬럼 삭제
+        df = df.drop(columns=['open', 'high', 'low', 'close', 'volume', 'ticker', 'stock_id'])
+
+        # NaN 값 제거
+        df = df.dropna()
+        price_df = price_df.loc[df.index]
+
+        print("len(df):", len(df))
+
+        # 데이터가 부족한 경우
+        if len(df) < config.SEQUENCE_LENGTH + 60:
+            # print("len(df):", len(df))
+            # print("config.SEQUENCE_LENGTH:", config.SEQUENCE_LENGTH)
+            # print("stock_name", stock_name)
+            return None, price_df, stock_name
+
+        # 특성 선택
+        features = df.values
+
+        # 스케일링 적용
+        features_scaled = apply_scalers_to_features(features, scalers)
+
+        # 윈도우 슬라이딩으로 X 생성 (최근 105일)
+        X = []
+        for i in range(len(features_scaled) - config.SEQUENCE_LENGTH - 105 + 1,
+                       len(features_scaled) - config.SEQUENCE_LENGTH + 1):
+            if i >= 0:
+                X.append(features_scaled[i:i + config.SEQUENCE_LENGTH])
+
+        if len(X) == 0:
+            print("523")
+            return None, price_df.tail(105), stock_name
+
+        # X = np.array(X)
+        X = np.stack(X, axis=0).astype(np.float32)
+        price_df = price_df.tail(105)
+
+        print("X: ", X.shape)
+        print("price_df: ", price_df.shape)
+        print("stock_name: ", stock_name)
+
+        return X, price_df, stock_name
+
+    except Exception as e:
+        print(f"Error processing stock data: {str(e)}")
+        return None, None, df['ticker'].iloc[0] if 'ticker' in df.columns else "UNKNOWN"
+
+
+def apply_scalers_to_features(features: np.ndarray, scalers: List[RobustScaler]) -> np.ndarray:
+    """특성에 스케일러 적용"""
+    features_scaled = np.zeros_like(features)
+
+    for i in range(features.shape[1]):
+        if i < len(scalers):
+            feature_data = features[:, i].reshape(-1, 1)
+            # NaN과 Inf 처리
+            median_val = scalers[i].center_[0] if hasattr(scalers[i], 'center_') else 0
+            feature_data = np.nan_to_num(feature_data, nan=median_val,
+                                         posinf=median_val, neginf=median_val)
+            features_scaled[:, i] = scalers[i].transform(feature_data).reshape(-1)
+        else:
+            features_scaled[:, i] = features[:, i]
+
+    return features_scaled
 
 # ============ 순수 예측 함수 ============
 def predict_new_data(X_new, current_price, model, scalers_X, scaler_Y):
@@ -540,7 +333,7 @@ def predict_new_data(X_new, current_price, model, scalers_X, scaler_Y):
         # 배치 처리 (메모리 효율성을 위해)
         batch_size = 32
         for i in range(0, len(X_tensor), batch_size):
-            batch = X_tensor[i:i+batch_size]
+            batch = X_tensor[i:i + batch_size]
             with torch.cuda.amp.autocast():
                 batch_pred = model(batch).cpu().numpy()
             predictions_list.append(batch_pred)
@@ -585,51 +378,8 @@ def predict_single(X_single, current_price, model, scalers_X, scaler_Y):
 
     return prices[0], returns[0]
 
-# ============ npz 파일에서 X만 로드하여 예측 ============
-def predict_from_npz(npz_path, current_prices, model, scalers_X, scaler_Y):
-    """
-    npz 파일에서 X 데이터만 로드하여 예측
-
-    Args:
-        npz_path: npz 파일 경로
-        current_prices: 현재 가격 (스칼라 또는 배열)
-        model: 학습된 모델
-        scalers_X: X 데이터용 스케일러들
-        scaler_Y: Y 데이터용 스케일러
-
-    Returns:
-        predictions_dict: 예측 결과 딕셔너리
-    """
-    # 데이터 로드
-    data = np.load(npz_path)
-    X = data['imfs']  # shape: (n_samples, 5, 8, 250)
-
-    print(f"Loaded X data: {X.shape}")
-
-    # 예측 수행
-    predicted_prices, predicted_returns = predict_new_data(
-        X, current_prices, model, scalers_X, scaler_Y
-    )
-
-    # 결과 정리
-    results = {
-        'predicted_prices': predicted_prices,
-        'predicted_returns': predicted_returns,
-        'current_prices': current_prices if not np.isscalar(current_prices) else [current_prices] * len(predicted_prices),
-        'n_samples': len(predicted_prices)
-    }
-
-    # 결과 출력
-    print(f"\n예측 완료: {results['n_samples']}개 샘플")
-    print(f"예측 가격 범위: {predicted_prices.min():.2f} ~ {predicted_prices.max():.2f}")
-    print(f"평균 예측 가격: {predicted_prices.mean():.2f}")
-    print(f"예측 수익률 범위: {predicted_returns.min()*100:.2f}% ~ {predicted_returns.max()*100:.2f}%")
-    print(f"평균 예측 수익률: {predicted_returns.mean()*100:.2f}%")
-
-    return results
 
 def parse_file_key(p: Path):
-
     stem = p.stem
     parts = stem.split("_")
 
@@ -666,22 +416,32 @@ def resolve_chart_ids(engine, keys_df: pd.DataFrame) -> pd.DataFrame:
         params[f"t{i}"] = row["ticker"]
         params[f"d{i}"] = row["chart_date"]
 
+    # sql = text(f"""
+    #     WITH keys(ticker, chart_date) AS (
+    #         VALUES {", ".join(values_sql)}
+    #     )
+    #     SELECT k.ticker, k.chart_date, c.id AS chart_id, c.chart_close AS current_price
+    #     FROM keys k
+    #     JOIN public.stocks s ON s.ticker = k.ticker
+    #     JOIN public.charts c ON c.stock_id = s.id AND c.chart_date = k.chart_date
+    # """)
+
     sql = text(f"""
-        WITH keys(ticker, chart_date) AS (
-            VALUES {", ".join(values_sql)}
-        )
-        SELECT k.ticker, k.chart_date, c.id AS chart_id, c.chart_close AS current_price
-        FROM keys k
-        JOIN public.stocks s ON s.ticker = k.ticker
-        JOIN public.charts c ON c.stock_id = s.id AND c.chart_date = k.chart_date
-    """)
+            WITH keys(ticker, chart_date) AS (
+                VALUES {", ".join(values_sql)}
+            )
+            SELECT k.ticker, k.chart_date, c.id AS chart_id, c.chart_close, c.chart_open, c.chart_high, c.chart_low, c.chart_volume
+            FROM keys k
+            JOIN public.stocks s ON s.ticker = k.ticker
+            JOIN public.charts c ON c.stock_id = s.id AND c.chart_date = k.chart_date
+        """)
     with engine.begin() as conn:
         df_map = pd.read_sql_query(sql, conn, params=params)
 
-    return keys_df.merge(df_map, on=["ticker","chart_date"], how="left")
+    return keys_df.merge(df_map, on=["ticker", "chart_date"], how="left")
 
 
-def save_records(engine, input_df:pd.DataFrame) -> pd.DataFrame:
+def save_records(engine, input_df: pd.DataFrame) -> pd.DataFrame:
 
     df = input_df.copy()
 
@@ -714,85 +474,293 @@ def save_records(engine, input_df:pd.DataFrame) -> pd.DataFrame:
 
         print(f">>> 삽입: {inserted}건, >>> 갱신: {updated}건")
 
+MODEL_DIR = os.getenv('MODEL_DIR')
+SCALERS_PATH = os.getenv('SCALERS_PATH')
+
+print(os.environ.get("MODEL_DIR"))
+print(os.environ.get("SCALERS_PATH"))
+
+# 모델 로드 함수 수정
+# def load_models_and_scalers(model_dir: str = MODEL_DIR, scaler_path: str = SCALERS_PATH):
+# def load_models_and_scalers(model_dir: str = 'models', scaler_path: str = 'scalers.pkl'):
+def load_models_and_scalers(model_dir: str = MODEL_DIR, scaler_path: str = SCALERS_PATH):
+# def load_models_and_scalers(model_dir: str = MODEL_DIR):
+    """
+    저장된 앙상블 모델과 스케일러를 불러오는 함수
+    """
+    config = Config()
+
+    # 스케일러 로드
+    print("스케일러 로드 중...")
+    with open(scaler_path, 'rb') as f:
+        scalers = pickle.load(f)
+    print(f"스케일러 로드 완료: {len(scalers)}개")
+
+    # 앙상블 모델 로드
+    print("앙상블 모델 로드 중...")
+    models = []
+    for i in range(5):  # 5개 앙상블 모델
+        model = VGG_LSTM_Model(config)
+        model_path = os.path.join(model_dir, f'model_{i}.pth')
+        if os.path.exists(model_path):
+            model.load_state_dict(torch.load(model_path, map_location=config.DEVICE))
+            model.to(config.DEVICE)
+            model.eval()
+            models.append(model)
+        else:
+            print(f"Warning: {model_path} not found")
+
+    ensemble = EnsembleModel(models, config)
+    print(f"앙상블 모델 로드 완료: {len(models)}개")
+
+    return ensemble, scalers, config
+
+
+def predict_stocks_from_db(engine, target_date: date = None):
+    """
+    데이터베이스에서 주식 데이터를 가져와 예측 수행
+    """
+    config = Config()
+
+    # 모델과 스케일러 로드
+    ensemble, scalers, config = load_models_and_scalers()
+
+    # 355일 이상의 데이터를 가진 종목 조회
+    window_size = config.SEQUENCE_LENGTH + 105  # 250 + 105
+    df_all = load_charts_joined(engine, window_size)
+    print("df_all: \n", df_all) # stock_id 다 돌고있음, 전체 데이터 불러오는....
+
+    if df_all.empty:
+        print(f"충분한 데이터({window_size}일 이상)를 가진 종목이 없습니다.")
+        return
+
+    # target_date가 지정된 경우 해당 날짜 데이터만 필터링
+    if target_date:
+        df_all['chart_date'] = pd.to_datetime(df_all['chart_date']).dt.date
+        # 각 종목별로 target_date를 포함한 이전 355일 데이터 필터링
+        filtered_dfs = []
+
+        print("df_all['stock_id'].unique(): ", df_all['stock_id'].unique())
+
+        for stock_id in df_all['stock_id'].unique():
+            # stock_df = df_all[df_all['stock_id'] == stock_id]
+            stock_df = df_all[df_all['stock_id'] == stock_id].copy()
+            stock_df = stock_df.sort_values('chart_date').reset_index(drop=True)
+
+            # target_date를 포함한 데이터가 있는지 확인
+            if target_date in stock_df['chart_date'].values:
+                # target_date 이전 355일 데이터 선택
+                end_idx = stock_df[stock_df['chart_date'] == target_date].index[0]
+                start_idx = max(0, end_idx - window_size + 1)
+                filtered_dfs.append(stock_df.iloc[start_idx:end_idx + 1])
+
+        if filtered_dfs:
+            df_all = pd.concat(filtered_dfs, ignore_index=True)
+            print("df_all_기준데이터로: \n", df_all)
+
+
+        else:
+            print(f"{target_date}에 해당하는 데이터가 없습니다.")
+            return
+
+    # 종목별 예측 수행
+    all_predictions = []
+
+    for stock_id, stock_df in tqdm(df_all.groupby('stock_id'), desc="종목별 예측"):
+        # 데이터 처리 및 예측
+        X, price_df, stock_name = process_stock_data_for_prediction(stock_df, scalers, config)
+
+        # print("X: \n", X)
+        # print("price_df: \n", price_df)
+
+        if X is not None and price_df is not None:
+            # 예측 수행
+            X_tensor = torch.FloatTensor(X).to(config.DEVICE)
+            predictions = ensemble.predict(X_tensor)
+
+            print("1111111111111111")
+
+            # 예측 결과와 chart_id 매핑
+            # price_df의 마지막 105개 행과 predictions 매핑
+            if len(predictions) <= len(price_df):
+                # predictions 개수만큼 price_df의 마지막 행들 사용
+                pred_df = price_df.tail(len(predictions)).copy()
+                pred_df['prediction'] = predictions
+                pred_df['stock_id'] = stock_id
+                pred_df['ticker'] = stock_name
+
+                # chart_id 가져오기
+                dates = pred_df.index.strftime('%Y-%m-%d').tolist()
+                chart_ids = []
+
+                for pred_date in dates:
+                    sql = text("""
+                               SELECT id
+                               FROM public.charts
+                               WHERE stock_id = :stock_id
+                                 AND chart_date = :chart_date
+                               """)
+                    with engine.begin() as conn:
+                        result = conn.execute(sql, {"stock_id": stock_id, "chart_date": pred_date}).fetchone()
+                        if result:
+                            chart_ids.append(result[0])
+                        else:
+                            chart_ids.append(None)
+
+                pred_df['chart_id'] = chart_ids
+                pred_df['record_direction'] = [get_direction(p) for p in predictions]
+                pred_df['record_prediction'] = predictions
+                # pred_df['record_prediction'] = predictions * 100  # 백분율로 변환
+
+                # chart_id가 있는 행만 선택
+                pred_df = pred_df[pred_df['chart_id'].notna()]
+                print("pred_df : ", pred_df)
+
+                if not pred_df.empty:
+                    all_predictions.append(pred_df[['chart_id', 'record_direction', 'record_prediction']])
+                    print("sdlkfj;slkfja;slfja;sklfja;slkfjajsuiohweu")
+
+    # 모든 예측 결과 합치기
+    if all_predictions:
+        final_predictions = pd.concat(all_predictions, ignore_index=True)
+
+        print(f"\n총 {len(final_predictions)}개 예측 생성")
+        print("\n예측 결과 샘플:")
+        print(final_predictions.head(10))
+
+        # 데이터베이스에 저장
+        save_records(engine, final_predictions)
+
+        return final_predictions
+    else:
+        print("예측 결과가 없습니다.")
+        return None
+
+
+def get_direction(p):
+    if p >= 0.55:  # 상승
+        return 'u'
+    elif p <= 0.45:  # 하락
+        return 'd'
+    else:
+        return 'n'  # 보합
+
+
 # ============ 메인 사용 예제 ============
 def main():
-    # 1. 모델과 스케일러 로드
-    print("Loading model and scalers...")
-    model, scalers_X, scaler_Y = load_model_and_scalers(
-        model_path=MODEL_PATH,
-        scalers_path=SCALERS_PATH
-    )
+    # ====변경한부분 시작====
 
-    # 2. 새로운 데이터로 예측 (예제)
-    print("\n" + "="*50)
-    print("예측 시작")
-    print("="*50)
+    # GPU 설정
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    """# 옵션 1: npz 파일에서 X 데이터 로드하여 예측
-    npz_path = '/content/drive/MyDrive/BK21_2/코스닥전종목/processed/A000440_processed.npz'
-    current_price = 1000.0  # 현재 주가 (예시)
-
-    results = predict_from_npz(
-        npz_path=npz_path,
-        current_prices=current_price,
-        model=model,
-        scalers_X=scalers_X,
-        scaler_Y=scaler_Y
-    )"""
-
+    # 예측 날짜 설정
     KST = ZoneInfo("Asia/Seoul")
-    # TODO: date 변경
-    # today_kst = datetime.now(KST).date()
-    today_kst = date(2025, 8, 8)
+    # target_date = datetime.now(KST).date()  # 오늘 날짜
+    # target_date = date(2025, 1, 20)  # 특정 날짜 지정
+    target_date = None
 
-    keys_df = collect_keys(PROJECT_OUTPUT, target_date=today_kst)
-    if keys_df.empty:
-        print("예측할 .npz 파일이 없습니다.")
-        return
+    # 데이터베이스에서 데이터 가져와 예측 수행
+    predictions = predict_stocks_from_db(engine, target_date)
+    '''
+    if predictions is not None:
+        # 예측 결과 요약
+        print("\n=" * 50)
+        print("예측 결과 요약")
+        print("=" * 50)
+        print(f"총 예측 건수: {len(predictions)}")
 
-    keys_df = resolve_chart_ids(engine, keys_df)
+        direction_counts = predictions['record_direction'].value_counts()
+        print(f"\n방향별 예측:")
+        print(f"  상승(u): {direction_counts.get('u', 0)}건")
+        print(f"  하락(d): {direction_counts.get('d', 0)}건")
+        print(f"  중립(n): {direction_counts.get('n', 0)}건")
 
-    # 매핑 실패한 파일 로그
-    missing = keys_df[keys_df["chart_id"].isna()]
-    if not missing.empty:
-        print("\n[WARN] 매핑 실패(차트 행 없음):")
-        print(missing[["path", "ticker", "chart_date"]].head(20))
-        print(f"... 총 {len(missing)}개 파일 스킵")
+        print(f"\n예측 확률 통계:")
+        print(f"  평균: {predictions['record_prediction'].mean():.2f}%")
+        print(f"  표준편차: {predictions['record_prediction'].std():.2f}%")
+        print(f"  최대: {predictions['record_prediction'].max():.2f}%")
+        print(f"  최소: {predictions['record_prediction'].min():.2f}%")'''
+    # ====변경한부분 끝====
 
-    ok_df = keys_df.dropna(subset=["chart_id"]).copy()
-
-    all_rows = []
-    for _, row in ok_df.iterrows():
-        npz_path = row["path"]
-        cur_price = float(row["current_price"])
-        res = predict_from_npz(
-            npz_path=npz_path,
-            current_prices=cur_price,
-            model=model,
-            scalers_X=scalers_X,
-            scaler_Y=scaler_Y
-        )
-
-        df = pd.DataFrame({
-            "chart_id": row["chart_id"],
-            "record_prediction": res['predicted_returns'] * 100,
-            'record_direction': ['u' if r > 0.02 else 'd' if r < -0.02 else 'n'
-                   for r in res['predicted_returns']]
-        })
-        all_rows.append(df)
-
-    if not all_rows:
-        print("예측 결과가 없습니다.")
-        return
-
-
-    df_all = pd.concat(all_rows, ignore_index=True)
-    print("\n예측 결과 요약:")
-    print(df_all[["chart_id", "record_prediction", "record_direction"]].head(10))
-
-    # db 저장
-    save_records(engine, df_all)
-
+    # # 1. 모델과 스케일러 로드
+    # print("Loading model and scalers...")
+    # model, scalers_X, scaler_Y = load_model_and_scalers(
+    #     model_path=MODEL_PATH,
+    #     scalers_path=SCALERS_PATH
+    # )
+    #
+    # # 2. 새로운 데이터로 예측 (예제)
+    # print("\n" + "="*50)
+    # print("예측 시작")
+    # print("="*50)
+    #
+    # """# 옵션 1: npz 파일에서 X 데이터 로드하여 예측
+    # npz_path = '/content/drive/MyDrive/BK21_2/코스닥전종목/processed/A000440_processed.npz'
+    # current_price = 1000.0  # 현재 주가 (예시)
+    #
+    # results = predict_from_npz(
+    #     npz_path=npz_path,
+    #     current_prices=current_price,
+    #     model=model,
+    #     scalers_X=scalers_X,
+    #     scaler_Y=scaler_Y
+    # )"""
+    #
+    # KST = ZoneInfo("Asia/Seoul")
+    # # TODO: date 변경
+    # # today_kst = datetime.now(KST).date()
+    # today_kst = date(2025, 8, 8)
+    #
+    # # TODO: db에서 today_kst로 df 불러와야함
+    #
+    # keys_df = collect_keys(PROJECT_OUTPUT, target_date=today_kst)
+    # if keys_df.empty:
+    #     print("예측할 .npz 파일이 없습니다.")
+    #     return
+    #
+    # keys_df = resolve_chart_ids(engine, keys_df)
+    #
+    # # 매핑 실패한 파일 로그
+    # missing = keys_df[keys_df["chart_id"].isna()]
+    # if not missing.empty:
+    #     print("\n[WARN] 매핑 실패(차트 행 없음):")
+    #     print(missing[["path", "ticker", "chart_date"]].head(20))
+    #     print(f"... 총 {len(missing)}개 파일 스킵")
+    #
+    # ok_df = keys_df.dropna(subset=["chart_id"]).copy()
+    #
+    # all_rows = []
+    # for _, row in ok_df.iterrows():
+    #     npz_path = row["path"]
+    #     cur_price = float(row["current_price"])
+    #     res = predict_from_npz(
+    #         npz_path=npz_path,
+    #         current_prices=cur_price,
+    #         model=model,
+    #         scalers_X=scalers_X,
+    #         scaler_Y=scaler_Y
+    #     )
+    #
+    #     df = pd.DataFrame({
+    #         "chart_id": row["chart_id"],
+    #         "record_prediction": res['predicted_returns'] * 100,
+    #         'record_direction': ['u' if r > 0.02 else 'd' if r < -0.02 else 'n'
+    #                for r in res['predicted_returns']]
+    #     })
+    #     all_rows.append(df)
+    #
+    # if not all_rows:
+    #     print("예측 결과가 없습니다.")
+    #     return
+    #
+    #
+    # df_all = pd.concat(all_rows, ignore_index=True)
+    # print("\n예측 결과 요약:")
+    # print(df_all[["chart_id", "record_prediction", "record_direction"]].head(10))
+    #
+    # # db 저장
+    # save_records(engine, df_all)
 
 
 if __name__ == "__main__":
@@ -800,10 +768,5 @@ if __name__ == "__main__":
     print(DB_URL)
     print("한글테스트")
 
-    # to_npz_from_db(engine)
-
-    # GPU 설정
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
 
     main()
