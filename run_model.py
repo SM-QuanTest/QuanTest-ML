@@ -1,28 +1,24 @@
+import json
 import logging
 import numpy as np
 import os
-import pandas as pd
-from PyEMD import CEEMDAN
-from multiprocessing import Pool
-from tqdm import tqdm
-from typing import Dict, List, Optional, Sequence, Tuple, Union
-from sklearn.preprocessing import RobustScaler
-
-from dotenv import load_dotenv
 import os
-from sqlalchemy import create_engine, text
-from pathlib import Path, PurePosixPath
-from psycopg2.extras import execute_values
-
+import pandas as pd
+import pickle
 import torch
 import torch.nn as nn
-import pickle
+from PyEMD import CEEMDAN
 from datetime import datetime, date
-from zoneinfo import ZoneInfo
-
+from dotenv import load_dotenv
+from multiprocessing import Pool
+from pathlib import Path, PurePosixPath
+from psycopg2.extras import execute_values
+from sklearn.preprocessing import RobustScaler
+from sqlalchemy import create_engine, text
+from tqdm import tqdm
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from typing import Tuple, Optional
-
-import json
+from zoneinfo import ZoneInfo
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -130,7 +126,6 @@ class VGG_LSTM_Model(nn.Module):
 
 ######### target_date 이하 chart 불러오기
 def fetch_chart_to_df_by_ticker_and_date(ticker: str, target_date: date):
-
     sql = text("""
                SELECT c.chart_date AS date, c.chart_open AS open, c.chart_high AS high, c.chart_low AS low, c.chart_close AS close, c.chart_volume AS volume
                FROM public.charts AS c
@@ -139,6 +134,7 @@ def fetch_chart_to_df_by_ticker_and_date(ticker: str, target_date: date):
                WHERE c.chart_date <= :target_date
                  AND s.ticker = :ticker
                ORDER BY c.chart_date ASC
+                   LIMIT 250;
                """)
 
     with engine.begin() as conn:
@@ -175,12 +171,8 @@ Returns: X, y_true (실제 변화율), valid_indices, stock_name
 
     try:
         # 예측 날짜 설정
-        # KST = ZoneInfo("Asia/Seoul")
-        # target_date = datetime.now(KST).date()  # 오늘 날짜
-        # target_date = date(2025, 1, 20)  # 특정 날짜 지정
         target_date = fetch_latest_date(engine)
 
-        # TODO: 403
         df = fetch_chart_to_df_by_ticker_and_date(ticker, target_date)
 
         df = df.replace([np.inf, -np.inf], np.nan)  # inf를 NaN으로 통일
@@ -255,7 +247,6 @@ def apply_scalers(X: np.ndarray, scalers: list) -> np.ndarray:
 
 
 def fetch_chart_ids_by_ticker_dates(engine, ticker: str, dates):
-
     if len(dates) == 0:
         return {}
     dt = pd.to_datetime(dates)
@@ -274,7 +265,6 @@ def fetch_chart_ids_by_ticker_dates(engine, ticker: str, dates):
 
 
 def classify_direction(preds, up_th=0.55, down_th=0.45):
-
     p = np.asarray(preds).reshape(-1)
     out = np.full(p.shape, 'n', dtype=object)
     out[p >= up_th] = 'u'
